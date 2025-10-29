@@ -138,7 +138,6 @@ def main():
     if not BOT_TOKEN:
         print("ERROR: BOT_TOKEN not set!")
         return
-
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check))
