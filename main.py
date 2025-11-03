@@ -1,160 +1,152 @@
 import os
-import uuid
-import logging
+import re
+import requests
 from datetime import datetime
-from contextlib import asynccontextmanager
-
-from fastapi import FastAPI, Request
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # === CONFIG ===
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN is required in Railway variables")
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # Set in Railway
+HGL_URL = "https://www.ssa.gov/employer/highgroup.txt"
 
-OWNER_ID = 937017799 # REPLACE WITH YOUR TELEGRAM USER ID
+# === CACHE FOR HIGH GROUP LIST (Updated every 6 hours) ===
+hgl_cache = {}
+hgl_last_update = None
 
-# === LOGGING ===
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("RescueBot")
+# === STATE-AREA RANGES (Pre-2011) ===
+STATE_AREA_RANGES = {
+    "CT": [(10,34)],"ME": [(4,7)],"MA": [(10,34)],"NH": [(1,3)],"RI": [(35,39)],"VT": [(8,9)],
+    "NJ": [(135,158)],"NY": [(50,134)],"PA": [(159,211)],"DE": [(221,222)],"DC": [(577,579)],
+    "FL": [(261,267),(589,595)],"GA": [(252,260),(667,675)],"MD": [(212,220)],
+    "NC": [(232,236),(237,246),(681,690)],"SC": [(247,251),(654,658)],"VA": [(223,231),(691,699)],"WV": [(232,236)],
+    "IL": [(318,361),(362,386)],"IN": [(303,317)],"MI": [(362,386)],"MN": [(468,477)],"OH": [(268,302)],"WI": [(387,399)],
+    "AZ": [(526,527),(600,601)],"NM": [(525,525),(585,585)],"OK": [(440,448)],"TX": [(449,467),(627,645)],
+    "CO": [(521,524),(650,653)],"ID": [(518,519)],"MT": [(516,517)],"NV": [(530,530),(680,680)],"UT": [(528,529)],"WY": [(520,520)],
+    "AK": [(574,574)],"CA": [(545,573),(602,626)],"HI": [(575,576),(586,586)],"OR": [(540,544)],"WA": [(531,539)],
+    "PR": [(580,584),(596,599)],"VI": [(580,584)],"GU": [(586,586)],"AS": [(586,586)],"MP": [(586,586)],"RR": [(700,728)]
+}
 
-# === TELEGRAM APP ===
-bot_app = Application.builder().token(BOT_TOKEN).build()
+# === FETCH HIGH GROUP LIST ===
+def get_hgl():
+    global hgl_cache, hgl_last_update
+    now = datetime.now()
+    if hgl_last_update is None or (now - hgl_last_update).total_seconds() > 21600:  # 6 hours
+        try:
+            r = requests.get(HGL_URL, timeout=10)
+            r.raise_for_status()
+            hgl = {}
+            for line in r.text.splitlines()[2:]:
+                parts = re.split(r'\s+', line.strip())
+                if len(parts) >= 2:
+                    area = parts[0].zfill(3)
+                    group = int(parts[1])
+                    hgl[area] = group
+            hgl_cache = hgl
+            hgl_last_update = now
+        except:
+            pass
+    return hgl_cache
 
-# === IN-MEMORY TRACKING (Railway is stateless) ===
-active_tracks = {}  # {track_id: owner_id}
+# === VALIDATE SSN ===
+def validate_ssn(ssn: str, dob: str = None):
+    s = re.sub(r'\D', '', ssn)
+    if len(s) != 9 or not s.isdigit():
+        return False, "Must be 9 digits", None, None
 
+    area_str = s[:3]
+    group = int(s[3:5])
+    area = int(area_str)
 
-# === /start → Generate Tracking Link (Owner Only) ===
+    # Basic rules
+    if area == 0: return False, "Area cannot be 000", None, None
+    if area == 666: return False, "Area 666 not issued", None, None
+    if 900 <= area <= 999: return False, "Area 900–999 reserved", None, None
+    if int(s[5:]) == 0: return False, "Serial cannot be 0000", None, None
+
+    # High Group Check
+    hgl = get_hgl()
+    high_group_passed = True
+    high_group_reason = ""
+    if hgl and area_str in hgl and group > hgl[area_str]:
+        high_group_passed = False
+        high_group_reason = f"Group {group} > issued {hgl[area_str]}"
+
+    # Possible States
+    possible_states = []
+    for state, ranges in STATE_AREA_RANGES.items():
+        for lo, hi in ranges:
+            if lo <= area <= hi:
+                possible_states.append(state)
+    if not possible_states:
+        possible_states = ["Unknown"]
+
+    # Rough year range (pre-2011 SSA rules)
+    year_range = "1936–2011"
+    if area < 100:
+        year_range = "Pre-2011 Randomized"
+
+    # Refine year if DOB given
+    if dob:
+        try:
+            dt = datetime.strptime(dob, "%m/%d/%Y")
+            year_range = f"Approximate DOB: {dt.year}"
+        except:
+            pass
+
+    return True, "Valid", possible_states, year_range if high_group_passed else high_group_reason
+
+# === BOT COMMANDS ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("Unauthorized access.")
-        return
-
-    track_id = str(uuid.uuid4())[:8]
-    active_tracks[track_id] = OWNER_ID
-
-    bot = await context.bot.get_me()
-    link = f"https://t.me/{bot.username}?start=help_{track_id}"
-
     await update.message.reply_text(
-        f"**RESCUE LINK GENERATED**\n\n"
-        f"Share this link:\n\n"
-        f"`{link}`\n\n"
-        f"Anyone who clicks will be asked to share location.\n"
-        f"You will receive live GPS instantly.",
-        parse_mode="Markdown"
+        "SSN Checker Pro v2\n\n"
+        "Send SSN to check: `123456789`\n"
+        "Optional DOB for refinement: `123456789 10/11/1993`\n"
+        "Example: `494089675 01/15/1987`\n"
+        "Works in private & groups.",
+        parse_mode='Markdown'
     )
-    log.info(f"Tracking link generated: {link}")
 
+async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    text = message.text.strip()
 
-# === Deep Link: help_XXXX → Auto Show BIG Location Button ===
-async def help_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args or not args[0].startswith("help_"):
+    # In group: require @botname
+    if message.chat.type in ['group', 'supergroup']:
+        bot = await context.bot.get_me()
+        bot_name = f"@{bot.username.lower()}"
+        if not text.lower().startswith(bot_name):
+            return
+        text = re.sub(f'@{bot.username}', '', text, count=1, flags=re.IGNORECASE).strip()
+
+    if not text:
+        await message.reply_text("Send SSN to check.")
         return
 
-    track_id = args[0].split("_", 1)[1]
-    if track_id not in active_tracks:
-        await update.message.reply_text("This link is invalid or expired.")
+    parts = text.split()
+    ssn_input = parts[0]
+    dob_input = parts[1] if len(parts) > 1 else None
+
+    valid, reason, states, year_range = validate_ssn(ssn_input, dob_input)
+
+    result = f"{'✅ VALID' if valid else '❌ INVALID'} `{ssn_input}`\n"
+    result += f"Possible States: {', '.join(states)}\n"
+    result += f"Estimated Year/DOB Info: {year_range}\n"
+    if reason != "Valid":
+        result += f"Note: {reason}"
+
+    await message.reply_text(result, parse_mode='Markdown')
+
+# === MAIN ===
+def main():
+    if not BOT_TOKEN:
+        print("ERROR: BOT_TOKEN not set!")
         return
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check))
 
-    context.user_data["track_id"] = track_id
+    print("SSN Checker Bot v2 is running...")
+    app.run_polling()
 
-    # GIANT BUTTON – fills screen
-    keyboard = [[InlineKeyboardButton("SEND MY LOCATION NOW", request_location=True)]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        "EMERGENCY HELP NEEDED\n\n"
-        "TAP THE BIG BUTTON BELOW\n"
-        "TO SEND YOUR CURRENT LOCATION",
-        reply_markup=reply_markup
-    )
-
-    # Notify owner: link opened
-    await context.bot.send_message(
-        chat_id=OWNER_ID,
-        text=f"LINK OPENED!\n\n"
-             f"Track ID: `{track_id}`\n"
-             f"User: {update.effective_user.full_name}\n"
-             f"Username: @{update.effective_user.username or 'None'}\n"
-             f"Waiting for location...",
-        parse_mode="Markdown"
-    )
-
-
-# === Location Received → Forward to Owner ===
-async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    loc = update.message.location
-    track_id = context.user_data.get("track_id")
-    if not track_id or track_id not in active_tracks:
-        return
-
-    user = update.effective_user
-    owner_id = active_tracks[track_id]
-    maps_url = f"https://maps.google.com/?q={loc.latitude},{loc.longitude}"
-
-    text = (
-        f"LOCATION RECEIVED!\n\n"
-        f"Track ID: `{track_id}`\n"
-        f"Name: {user.full_name}\n"
-        f"Username: @{user.username or 'None'}\n"
-        f"User ID: `{user.id}`\n"
-        f"Time: {datetime.now():%Y-%m-%d %H:%M:%S}\n"
-        f"GPS: `{loc.latitude}, {loc.longitude}`\n"
-        f"[Open in Google Maps]({maps_url})"
-    )
-
-    await context.bot.send_location(
-        chat_id=owner_id,
-        latitude=loc.latitude,
-        longitude=loc.longitude,
-        caption=text,
-        parse_mode="Markdown"
-    )
-
-    await update.message.reply_text("Location sent. Help is on the way.")
-
-    # Optional: auto-remove after first use
-    # del active_tracks[track_id]
-
-
-# === FASTAPI APP WITH LIFESPAN (NO DEPRECATION) ===
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # ---- STARTUP: Set Webhook ----
-    webhook_url = f"https://{os.getenv('RAILWAY_STATIC_URL')}/webhook"
-    await bot_app.bot.set_webhook(url=webhook_url)
-    log.info(f"Webhook set: {webhook_url}")
-
-    yield  # App runs here
-
-    # ---- SHUTDOWN: Clean up ----
-    await bot_app.bot.delete_webhook(drop_pending_updates=True)
-    log.info("Webhook removed – bot stopped.")
-
-
-app = FastAPI(lifespan=lifespan)
-
-
-# === WEBHOOK ENDPOINT ===
-@app.post("/webhook")
-async def webhook(request: Request):
-    json_data = await request.json()
-    update = Update.de_json(json_data, bot_app.bot)
-    await bot_app.process_update(update)
-    return {"ok": True}
-
-
-# === HEALTH CHECK ===
-@app.get("/")
-async def health():
-    return {"status": "running", "bot": "RescueLink"}
-
-
-# === REGISTER HANDLERS ===
-bot_app.add_handler(CommandHandler("start", start))
-bot_app.add_handler(CommandHandler("start", help_user))  # Handles deep links
-bot_app.add_handler(MessageHandler(filters.LOCATION, location_handler))
+if __name__ == "__main__":
+    main()
