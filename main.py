@@ -9,7 +9,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 BOT_TOKEN = os.getenv("BOT_TOKEN")  # Set in Railway
 HGL_URL = "https://www.ssa.gov/employer/highgroup.txt"
 
-# === CACHE FOR HIGH GROUP LIST ===
+# === CACHE FOR HIGH GROUP LIST (Updated every 6 hours) ===
 hgl_cache = {}
 hgl_last_update = None
 
@@ -28,7 +28,6 @@ STATE_AREA_RANGES = {
 
 # === FETCH HIGH GROUP LIST ===
 def get_hgl():
-    """Fetch the SSA high group list and cache it."""
     global hgl_cache, hgl_last_update
     now = datetime.now()
     if hgl_last_update is None or (now - hgl_last_update).total_seconds() > 21600:  # 6 hours
@@ -41,31 +40,15 @@ def get_hgl():
                 if len(parts) >= 2:
                     area = parts[0].zfill(3)
                     group = int(parts[1])
-                    if area not in hgl:
-                        hgl[area] = []
-                    hgl[area].append(group)
+                    hgl[area] = group
             hgl_cache = hgl
             hgl_last_update = now
-        except Exception as e:
-            print("Failed to fetch high group list:", e)
+        except:
+            pass
     return hgl_cache
 
-# === ESTIMATE ISSUE YEAR FROM GROUP ===
-def estimate_year(area_str: str, group: int):
-    hgl = get_hgl()
-    if area_str not in hgl:
-        return "Unknown"
-    groups = hgl[area_str]
-    try:
-        idx = groups.index(group)
-        # Approximate year: assuming first issuance 1936, each group ~2 years
-        year = 1936 + idx * 2
-        return f"Approx Year: {year}"
-    except ValueError:
-        return "Group exceeds issued high group"
-
 # === VALIDATE SSN ===
-def validate_ssn(ssn: str, state: str = None, dob: str = None):
+def validate_ssn(ssn: str, dob: str = None):
     s = re.sub(r'\D', '', ssn)
     if len(s) != 9 or not s.isdigit():
         return False, "Must be 9 digits", None, None
@@ -82,29 +65,44 @@ def validate_ssn(ssn: str, state: str = None, dob: str = None):
 
     # High Group Check
     hgl = get_hgl()
-    if hgl and area_str in hgl and group > max(hgl[area_str]):
-        return False, f"Group {group} > issued {max(hgl[area_str])}", None, None
+    high_group_passed = True
+    high_group_reason = ""
+    if hgl and area_str in hgl and group > hgl[area_str]:
+        high_group_passed = False
+        high_group_reason = f"Group {group} > issued {hgl[area_str]}"
 
-    # State-Area Match (pre-2011)
-    state_name = None
-    if state and state.upper() in STATE_AREA_RANGES:
-        valid = any(lo <= area <= hi for lo, hi in STATE_AREA_RANGES[state.upper()])
-        state_name = state.upper()
-        if not valid:
-            return False, f"Area {area} not issued in {state_name}", state_name, None
+    # Possible States
+    possible_states = []
+    for state, ranges in STATE_AREA_RANGES.items():
+        for lo, hi in ranges:
+            if lo <= area <= hi:
+                possible_states.append(state)
+    if not possible_states:
+        possible_states = ["Unknown"]
 
-    # Estimate year
-    est_year = estimate_year(area_str, group)
+    # Rough year range (pre-2011 SSA rules)
+    year_range = "1936–2011"
+    if area < 100:
+        year_range = "Pre-2011 Randomized"
 
-    return True, "Valid", state_name, est_year
+    # Refine year if DOB given
+    if dob:
+        try:
+            dt = datetime.strptime(dob, "%m/%d/%Y")
+            year_range = f"Approximate DOB: {dt.year}"
+        except:
+            pass
+
+    return True, "Valid", possible_states, year_range if high_group_passed else high_group_reason
 
 # === BOT COMMANDS ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "SSN Checker Pro\n\n"
-        "Send: `123456789 [STATE] [DOB]`\n"
-        "Example: `@yourbot 494089675 ME 10/11/1993`\n\n"
-        "Returns: validity, state, and approximate issuance year.",
+        "SSN Checker Pro v2\n\n"
+        "Send SSN to check: `123456789`\n"
+        "Optional DOB for refinement: `123456789 10/11/1993`\n"
+        "Example: `494089675 01/15/1987`\n"
+        "Works in private & groups.",
         parse_mode='Markdown'
     )
 
@@ -115,26 +113,26 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # In group: require @botname
     if message.chat.type in ['group', 'supergroup']:
         bot = await context.bot.get_me()
-        if not text.lower().startswith(f"@{bot.username.lower()}"):
+        bot_name = f"@{bot.username.lower()}"
+        if not text.lower().startswith(bot_name):
             return
         text = re.sub(f'@{bot.username}', '', text, count=1, flags=re.IGNORECASE).strip()
 
-    parts = text.split()
-    if len(parts) < 1:
-        await message.reply_text("Send SSN [STATE] [DOB]")
+    if not text:
+        await message.reply_text("Send SSN to check.")
         return
 
-    ssn = parts[0]
-    state = parts[1].upper() if len(parts) > 1 else None
-    dob = parts[2] if len(parts) > 2 else None
+    parts = text.split()
+    ssn_input = parts[0]
+    dob_input = parts[1] if len(parts) > 1 else None
 
-    valid, reason, state_name, est_year = validate_ssn(ssn, state, dob)
+    valid, reason, states, year_range = validate_ssn(ssn_input, dob_input)
 
-    result = f"{'✅ VALID' if valid else '❌ INVALID'} `{ssn}`\n"
-    if state_name: result += f"State: `{state_name}`\n"
-    if est_year: result += f"{est_year}\n"
-    if dob: result += f"DOB: `{dob}`\n"
-    result += f"\n{reason}"
+    result = f"{'✅ VALID' if valid else '❌ INVALID'} `{ssn_input}`\n"
+    result += f"Possible States: {', '.join(states)}\n"
+    result += f"Estimated Year/DOB Info: {year_range}\n"
+    if reason != "Valid":
+        result += f"Note: {reason}"
 
     await message.reply_text(result, parse_mode='Markdown')
 
@@ -147,7 +145,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check))
 
-    print("SSN Checker Bot is running...")
+    print("SSN Checker Bot v2 is running...")
     app.run_polling()
 
 if __name__ == "__main__":
