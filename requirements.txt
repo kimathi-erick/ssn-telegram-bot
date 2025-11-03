@@ -2,3 +2,6 @@ python-telegram-bot==20.8
 requests
 aiohttp
 python-dateutil
+fastapi
+uvicorn
+python-telegram-bot[async]
