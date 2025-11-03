@@ -1,17 +1,30 @@
 import os
 import re
-import requests
+import aiohttp
+import asyncio
+import logging
 from datetime import datetime
+from dateutil.parser import parse
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # === CONFIG ===
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # Set in Railway
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # Railway environment variable
 HGL_URL = "https://www.ssa.gov/employer/highgroup.txt"
+
+# === LOGGING ===
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 # === CACHE FOR HIGH GROUP LIST (Updated every 6 hours) ===
 hgl_cache = {}
 hgl_last_update = None
+
+# === REQUEST COUNTER ===
+request_count = 0
 
 # === FULL STATE-AREA RANGES (Pre-2011) ===
 STATE_AREA_RANGES = {
@@ -26,29 +39,38 @@ STATE_AREA_RANGES = {
     "PR": [(580,584),(596,599)],"VI": [(580,584)],"GU": [(586,586)],"AS": [(586,586)],"MP": [(586,586)],"RR": [(700,728)]
 }
 
-# === FETCH HIGH GROUP LIST ===
-def get_hgl():
+# === ASYNC FETCH HIGH GROUP LIST ===
+async def get_hgl():
     global hgl_cache, hgl_last_update
     now = datetime.now()
-    if hgl_last_update is None or (now - hgl_last_update).total_seconds() > 21600:  # 6 hours
+    if hgl_last_update is None or (now - hgl_last_update).total_seconds() > 21600:
         try:
-            r = requests.get(HGL_URL, timeout=10)
-            r.raise_for_status()
-            hgl = {}
-            for line in r.text.splitlines()[2:]:
-                parts = re.split(r'\s+', line.strip())
-                if len(parts) >= 2:
-                    area = parts[0].zfill(3)
-                    group = int(parts[1])
-                    hgl[area] = group
-            hgl_cache = hgl
-            hgl_last_update = now
-        except:
-            pass
+            async with aiohttp.ClientSession() as session:
+                async with session.get(HGL_URL, timeout=10) as resp:
+                    text = await resp.text()
+                    hgl = {}
+                    for line in text.splitlines()[2:]:
+                        parts = re.split(r'\s+', line.strip())
+                        if len(parts) >= 2:
+                            area = parts[0].zfill(3)
+                            group = int(parts[1])
+                            hgl[area] = group
+                    hgl_cache = hgl
+                    hgl_last_update = now
+                    logger.info("High Group List updated")
+        except Exception as e:
+            logger.warning("Failed to fetch HGL: %s", e)
     return hgl_cache
 
+# === PARSE DOB FLEXIBLY ===
+def parse_dob(dob_str):
+    try:
+        return parse(dob_str).date()
+    except:
+        return None
+
 # === VALIDATE SSN ===
-def validate_ssn(ssn: str, state: str = None, dob: str = None):
+async def validate_ssn(ssn: str, state: str = None, dob: str = None):
     s = re.sub(r'\D', '', ssn)
     if len(s) != 9 or not s.isdigit():
         return False, "Must be 9 digits"
@@ -64,32 +86,24 @@ def validate_ssn(ssn: str, state: str = None, dob: str = None):
     if int(s[5:]) == 0: return False, "Serial cannot be 0000"
 
     # High Group Check
-    hgl = get_hgl()
+    hgl = await get_hgl()
     if hgl and area_str in hgl and group > hgl[area_str]:
         return False, f"Group {group} > issued {hgl[area_str]}"
 
     # DOB Check
-    if dob:
-        try:
-            dob_year = datetime.strptime(dob, "%m/%d/%Y").year
-            if dob_year < 1930 and area > 587:
-                return False, "High area for pre-1930 birth"
-            if dob_year > 2011 and area < 100:
-                return False, "Low area post-randomization"
-        except:
-            pass
+    dob_date = parse_dob(dob) if dob else None
+    if dob_date:
+        if dob_date.year < 1930 and area > 587:
+            return False, "High area for pre-1930 birth"
+        if dob_date.year > 2011 and area < 100:
+            return False, "Low area post-randomization"
 
     # State-Area Match (pre-2011)
-    if state and dob:
-        try:
-            dob_year = datetime.strptime(dob, "%m/%d/%Y").year
-            if dob_year < 2011 and state.upper() in STATE_AREA_RANGES:
-              
-                valid = any(lo <= area <= hi for lo, hi in STATE_AREA_RANGES[state.upper()])
-                if not valid:
-                    return False, f"Area {area} not issued in {state}"
-        except:
-            pass
+    if state and dob_date:
+        if dob_date.year < 2011 and state.upper() in STATE_AREA_RANGES:
+            valid_area = any(lo <= area <= hi for lo, hi in STATE_AREA_RANGES[state.upper()])
+            if not valid_area:
+                return False, f"Area {area} not issued in {state}"
 
     return True, "Valid"
 
@@ -99,19 +113,33 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "SSN Checker Pro\n\n"
         "Send: `123456789 [STATE] [DOB]`\n"
         "Example: `@yourbot 494089675 MO 10/11/1993`\n\n"
-        "Works in private & groups.",
+        "Commands: /help, /stats",
         parse_mode='Markdown'
     )
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "SSN Checker Pro Commands:\n"
+        "/start - Welcome message\n"
+        "/help - This message\n"
+        "/stats - Show total checks\n"
+        "Send SSN [STATE] [DOB] to check validity.\n\n"
+        "Example: `123456789 MO 10/11/1993`",
+        parse_mode='Markdown'
+    )
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Total checks done: {request_count}")
+
 async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global request_count
     message = update.message
     text = message.text.strip()
 
     # In group: require @botname
     if message.chat.type in ['group', 'supergroup']:
         bot = await context.bot.get_me()
-        bot_name = f"@{bot.username.lower()}"
-        if not text.lower().startswith(bot_name):
+        if f"@{bot.username.lower()}" not in text.lower():
             return
         text = re.sub(f'@{bot.username}', '', text, count=1, flags=re.IGNORECASE).strip()
 
@@ -124,22 +152,30 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = parts[1].upper() if len(parts) > 1 else None
     dob = parts[2] if len(parts) > 2 else None
 
-    valid, reason = validate_ssn(ssn, state, dob)
+    valid, reason = await validate_ssn(ssn, state, dob)
+    status = "✅ VALID" if valid else "❌ INVALID"
 
-    result = f"{'VALID' if valid else 'INVALID'} `{ssn}`\n"
+    result = f"{status} `{ssn}`\n"
     if state: result += f"State: `{state}`\n"
     if dob: result += f"DOB: `{dob}`\n"
     result += f"\n{reason}"
 
     await message.reply_text(result, parse_mode='Markdown')
 
+    # Log & count
+    logger.info("User %s sent: %s", message.from_user.username, text)
+    request_count += 1
+
 # === MAIN ===
 def main():
     if not BOT_TOKEN:
         print("ERROR: BOT_TOKEN not set!")
         return
+
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check))
 
     print("SSN Checker Bot is running...")
@@ -147,4 +183,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-  
+
